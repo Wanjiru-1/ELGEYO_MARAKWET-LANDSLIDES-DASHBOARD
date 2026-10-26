@@ -1,6 +1,6 @@
 // Elgeyo Marakwet Landslides Dashboard - GEE Script
 /******************************************************************************
- *  ELGEYO MARAKWET LANDSLIDE DASHBOARD — Version 5 (final)
+ *  ELGEYO MARAKWET LANDSLIDE DASHBOARD — Version 6 (verified calculations)
  *
  *  Pre-configured with your uploaded assets:
  *    projects/elegant-shelter-461411-v2/assets/elgeyo_county
@@ -134,8 +134,12 @@ var affectedSites = ee.FeatureCollection([
 
 function maskS2(img) {
   var qa = img.select('QA60');
+  var scl = img.select('SCL');
   var mask = qa.bitwiseAnd(1 << 10).eq(0)
-              .and(qa.bitwiseAnd(1 << 11).eq(0));
+              .and(qa.bitwiseAnd(1 << 11).eq(0))
+              .and(scl.neq(0)).and(scl.neq(1)).and(scl.neq(3))
+              .and(scl.neq(8)).and(scl.neq(9)).and(scl.neq(10))
+              .and(scl.neq(11));
   return img.updateMask(mask).divide(10000)
             .copyProperties(img, ['system:time_start']);
 }
@@ -151,6 +155,7 @@ function safeS2Composite(startDate, endDate, cloudPct) {
     col.median().clip(studyArea),
     ee.Image.constant([0, 0, 0, 0])
       .rename(['B2', 'B3', 'B4', 'B8'])
+      .updateMask(ee.Image.constant(0))
       .clip(studyArea)
   ));
 }
@@ -167,7 +172,8 @@ function safeNDVI(startDate, endDate, cloudPct, bandName) {
   return ee.Image(ee.Algorithms.If(
     col.size().gt(0),
     col.median().rename(bandName).clip(studyArea),
-    ee.Image.constant(0.4).rename(bandName).clip(studyArea)
+    ee.Image.constant(0).rename(bandName)
+      .updateMask(ee.Image.constant(0)).clip(studyArea)
   ));
 }
 
@@ -181,12 +187,14 @@ var elev   = srtm.rename('elev');
 var curvature = elev.convolve(ee.Kernel.laplacian8()).rename('curvature');
 
 var rainsClimatology = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
-  .filterDate('1991-10-01', '2020-12-31')
+  .filterDate('1991-10-01', '2021-01-01')
   .filter(ee.Filter.calendarRange(10, 12, 'month'))
   .sum().divide(30).rename('OND_avg_mm');
 
 var rainfall7day = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
-  .filterDate(eventDate.advance(-7, 'day'), eventDate.advance(1, 'day'))
+  // filterDate uses an exclusive end: this is exactly the seven days before
+  // the event date (24-30 October 2025 for a 31 October event).
+  .filterDate(eventDate.advance(-7, 'day'), eventDate)
   .sum().rename('rain_7day');
 
 var ndviCurrent = safeNDVI('2024-01-01', '2025-10-30', 60, 'NDVI');
@@ -200,11 +208,12 @@ var smCol = ee.ImageCollection('NASA/SMAP/SPL4SMGP/008')
 var soilMoisture = ee.Image(ee.Algorithms.If(
   smCol.size().gt(0),
   smCol.mean().rename('soil_moisture'),
-  ee.Image.constant(0.3).rename('soil_moisture')
+  ee.Image.constant(0).rename('soil_moisture')
+    .updateMask(ee.Image.constant(0))
 ));
 
 // ============================================================================
-// 6. PREDICTIVE LANDSLIDE SUSCEPTIBILITY MODEL
+// 6. SCREENING-LEVEL LANDSLIDE SUSCEPTIBILITY MODEL
 // ============================================================================
 
 var slopeScore = slope.subtract(15).divide(30).clamp(0, 1).rename('slope_s');
@@ -233,15 +242,19 @@ var riskScore = slopeScore.multiply(weights.slope)
   .add(smScore.multiply(weights.sm))
   .rename('risk_score').clip(studyArea);
 
+var RISK_MODERATE = 0.30;
+var RISK_HIGH = 0.45;
+var RISK_EXTREME = 0.60;
+
 var riskClass = riskScore
-  .where(riskScore.lt(0.3), 1)
-  .where(riskScore.gte(0.3).and(riskScore.lt(0.45)), 2)
-  .where(riskScore.gte(0.45).and(riskScore.lt(0.6)), 3)
-  .where(riskScore.gte(0.6), 4)
+  .where(riskScore.lt(RISK_MODERATE), 1)
+  .where(riskScore.gte(RISK_MODERATE).and(riskScore.lt(RISK_HIGH)), 2)
+  .where(riskScore.gte(RISK_HIGH).and(riskScore.lt(RISK_EXTREME)), 3)
+  .where(riskScore.gte(RISK_EXTREME), 4)
   .toInt().rename('risk_class').clip(studyArea);
 
 // ============================================================================
-// 7. MODEL VALIDATION
+// 7. EXPLORATORY KNOWN-SITE CHECK (NOT INDEPENDENT VALIDATION)
 // ============================================================================
 
 var validation = riskScore.reduceRegions({
@@ -279,7 +292,7 @@ panel.add(ui.Label({
           margin: '0 0 4px 0'}
 }));
 panel.add(ui.Label({
-  value: 'Past damage (Nov 2025) + future risk prediction',
+  value: 'Observed change + screening-level landslide susceptibility',
   style: {fontSize: '12px', color: '#555', margin: '0 0 10px 0'}
 }));
 
@@ -289,22 +302,17 @@ var impact = ui.Panel({
 });
 impact.add(ui.Label('NOV 2025 IMPACT',
   {fontSize: '11px', fontWeight: 'bold', color: '#B71C1C', margin: '0'}));
-impact.add(ui.Label('Confirmed deaths: 26+   |   Missing: 25',
-  {fontSize: '12px', margin: '3px 0 0 0'}));
-impact.add(ui.Label('Hospitalised: 26+   |   Homes destroyed: 1,000+',
-  {fontSize: '12px', margin: '0'}));
-impact.add(ui.Label('19 deaths from a single extended family in Endo Ward',
-  {fontSize: '11px', margin: '4px 0 0 0', color: '#666',
-   fontWeight: 'bold'}));
+impact.add(ui.Label('Reported impact figures require confirmation against an authoritative incident record.',
+  {fontSize: '11px', margin: '3px 0 0 0', color: '#666'}));
 panel.add(impact);
 
 panel.add(ui.Label('CHOOSE VIEW',
   {fontSize: '12px', fontWeight: 'bold', margin: '14px 0 4px 0'}));
 
 var views = [
-  '🔮 PREDICTIVE: future risk (continuous)',
-  '🔮 PREDICTIVE: future risk (4 classes)',
-  '🔮 PREDICTIVE: extreme-risk zones only',
+  '🔎 SUSCEPTIBILITY: continuous score',
+  '🔎 SUSCEPTIBILITY: 4 classes',
+  '🔎 SUSCEPTIBILITY: extreme zones only',
   '📊 Past damage: detected scars (Nov 2025)',
   '📊 Past damage: NDVI change',
   '🛰 Sentinel-2 BEFORE (true colour)',
@@ -344,14 +352,14 @@ var inspector = ui.Panel(
 );
 panel.add(inspector);
 
-panel.add(ui.Label('MODEL VALIDATION',
+panel.add(ui.Label('KNOWN-SITE CHECK',
   {fontSize: '12px', fontWeight: 'bold', margin: '14px 0 4px 0'}));
 var validationPanel = ui.Panel({
   style: {backgroundColor: '#E8F5E9', padding: '8px',
           border: '1px solid #4CAF50'}
 });
 validationPanel.add(ui.Label(
-  'Computing risk scores at the actual 2025 disaster sites...',
+  'Sampling susceptibility scores at reported 2025 affected sites...',
   {fontSize: '11px', color: '#555'}));
 panel.add(validationPanel);
 
@@ -364,25 +372,26 @@ validation.evaluate(function(fc, err) {
   }
   if (!fc || !fc.features || fc.features.length === 0) {
     validationPanel.add(ui.Label(
-      'Validation could not run (no features returned).',
+      'Known-site check could not run (no features returned).',
       {fontSize: '11px', color: '#B71C1C'}));
     return;
   }
   validationPanel.add(ui.Label(
-    'Risk score predicted at sites that were actually hit in Nov 2025:',
+    'Susceptibility score sampled at reported affected sites:',
     {fontSize: '11px', fontWeight: 'bold', color: '#1B5E20', margin: '0'}));
   fc.features.forEach(function(f) {
     var score = (f.properties && f.properties.risk_score !== undefined)
                 ? f.properties.risk_score : null;
-    var scoreLbl = (score !== null) ? score.toFixed(3) : 'n/a';
-    var cls = (score === null) ? '?' :
-              (score < 0.3) ? 'LOW' :
-              (score < 0.45) ? 'MODERATE' :
-              (score < 0.6) ? 'HIGH' : 'EXTREME';
-    var color = (score === null) ? '#888' :
-                (score < 0.3) ? '#388E3C' :
-                (score < 0.45) ? '#FBC02D' :
-                (score < 0.6) ? '#F57C00' : '#B71C1C';
+    var validScore = (typeof score === 'number' && isFinite(score));
+    var scoreLbl = validScore ? score.toFixed(3) : 'n/a';
+    var cls = !validScore ? '?' :
+              (score < RISK_MODERATE) ? 'LOW' :
+              (score < RISK_HIGH) ? 'MODERATE' :
+              (score < RISK_EXTREME) ? 'HIGH' : 'EXTREME';
+    var color = !validScore ? '#888' :
+                (score < RISK_MODERATE) ? '#388E3C' :
+                (score < RISK_HIGH) ? '#FBC02D' :
+                (score < RISK_EXTREME) ? '#F57C00' : '#B71C1C';
     var name = (f.properties && f.properties.name) ?
                f.properties.name : 'unknown';
     validationPanel.add(ui.Label(
@@ -390,9 +399,8 @@ validation.evaluate(function(fc, err) {
       {fontSize: '11px', color: color, margin: '2px 0 0 0'}));
   });
   validationPanel.add(ui.Label(
-    'Higher scores at known sites = better-calibrated model.',
-    {fontSize: '10px', color: '#666', margin: '4px 0 0 0',
-     fontWeight: 'bold'}));
+    'Exploratory check only: these same sites were not held out for independent validation. Field observations and non-event locations are needed to measure accuracy.',
+    {fontSize: '10px', color: '#666', margin: '4px 0 0 0'}));
 });
 
 panel.add(ui.Label('PREDICTIVE MODEL',
@@ -463,7 +471,7 @@ function addContextLayers() {
 function renderView(choice) {
   clearLayers();
 
-  if (choice === '🔮 PREDICTIVE: future risk (continuous)') {
+  if (choice === '🔎 SUSCEPTIBILITY: continuous score') {
     map.addLayer(riskScore,
       {min: 0, max: 0.8,
        palette: ['#1A9641', '#A6D96A', '#FFFFBF',
@@ -473,10 +481,10 @@ function renderView(choice) {
       {color: '#1A9641', label: 'Very low risk (0.0)'},
       {color: '#FFFFBF', label: 'Moderate (0.3-0.45)'},
       {color: '#FDAE61', label: 'High (0.45-0.6)'},
-      {color: '#D7191C', label: 'Extreme (>0.6)'}
-    ], 'Predicted future risk');
+      {color: '#D7191C', label: 'Extreme (>=0.60)'}
+    ], 'Screening-level susceptibility');
 
-  } else if (choice === '🔮 PREDICTIVE: future risk (4 classes)') {
+  } else if (choice === '🔎 SUSCEPTIBILITY: 4 classes') {
     map.addLayer(riskClass,
       {min: 1, max: 4,
        palette: ['#388E3C', '#FBC02D', '#F57C00', '#B71C1C']},
@@ -488,32 +496,32 @@ function renderView(choice) {
       {color: '#B71C1C', label: '4 - Extreme'}
     ], 'Risk class');
 
-  } else if (choice === '🔮 PREDICTIVE: extreme-risk zones only') {
-    map.addLayer(riskScore.gte(0.55).selfMask(),
+  } else if (choice === '🔎 SUSCEPTIBILITY: extreme zones only') {
+    map.addLayer(riskScore.gte(RISK_EXTREME).selfMask(),
       {palette: ['#B71C1C']}, 'Extreme-risk zones');
     setLegend([
-      {color: '#B71C1C', label: 'Pixels predicted as extreme risk'}
+      {color: '#B71C1C', label: 'Pixels with susceptibility >=0.60'}
     ], 'Extreme-risk zones');
 
   } else if (choice === '📊 Past damage: detected scars (Nov 2025)') {
     map.addLayer(s2After, {bands: ['B4','B3','B2'], min: 0, max: 0.3},
                  'Sentinel-2 after (context)');
     map.addLayer(detectedScars, {palette: ['#FF1744']},
-                 'Detected scars');
+                 'Candidate disturbance areas');
     setLegend([
       {color: '#FF1744',
-       label: 'Detected scars (NDVI loss >0.25 + slope >25°)'}
-    ], 'Past damage detection');
+       label: 'Candidate disturbance (NDVI loss >0.25 + slope >25°)'}
+    ], 'Satellite change screening');
 
   } else if (choice === '📊 Past damage: NDVI change') {
     map.addLayer(ndviDiff,
-      {min: -0.6, max: 0.3,
-       palette: ['#8B0000', '#FF0000', '#FF8800', '#FFFF00',
-                 '#FFFFFF', '#90EE90', '#006400']},
+      {min: -0.6, max: 0.6,
+       palette: ['#8B0000', '#FF0000', '#FFB07C', '#FFFFFF',
+                 '#A8DDA8', '#36A657', '#006400']},
       'NDVI change');
     setLegend([
       {color: '#8B0000', label: 'Severe vegetation loss'},
-      {color: '#FFFF00', label: 'No change'},
+      {color: '#FFFFFF', label: 'Little or no change'},
       {color: '#006400', label: 'Vegetation gain'}
     ], 'NDVI change');
 
@@ -583,9 +591,11 @@ function renderView(choice) {
     ], 'Vegetation cover');
 
   } else if (choice === '🌍 Driver: land cover') {
-    map.addLayer(landCover.clip(studyArea), {
-      bands: ['Map'],
-      min: 10, max: 100,
+    var landCoverDisplay = landCover.select('Map').remap(
+      [10,20,30,40,50,60,70,80,90,95,100],
+      [1,2,3,4,5,6,7,8,9,10,11]);
+    map.addLayer(landCoverDisplay.clip(studyArea), {
+      min: 1, max: 11,
       palette: [
         '006400', 'FFBB22', 'FFFF4C', 'F096FF', 'FA0000',
         'B4B4B4', 'F0F0F0', '0064C8', '0096A0', '00CF75', 'FAE6A0'
@@ -610,7 +620,7 @@ function renderView(choice) {
       {color: '#FFFFFF', label: '0 mm'},
       {color: '#4080FF', label: '~150 mm'},
       {color: '#000080', label: '>250 mm'}
-    ], '7-day rainfall (mm)');
+    ], '7-day rainfall (24-30 Oct 2025)');
   }
 
   addContextLayers();
@@ -637,7 +647,7 @@ map.onClick(function(coords) {
     cls:   riskClass.reduceRegion(ee.Reducer.first(), pt, 30).get('risk_class')
   }).evaluate(function(d, err) {
     inspector.clear();
-    if (err) {
+    if (err || !d) {
       inspector.add(ui.Label('Error: ' + err,
         {fontSize: '11px', color: '#B71C1C'}));
       return;
@@ -648,26 +658,36 @@ map.onClick(function(coords) {
       coords.lat.toFixed(4) + ', ' + coords.lon.toFixed(4),
       {fontSize: '11px', margin: '0'}));
 
+    function numberOrNull(value) {
+      return (typeof value === 'number' && isFinite(value)) ? value : null;
+    }
+    var elevValue = numberOrNull(d.elev);
+    var slopeValue = numberOrNull(d.slope);
+    var ndviValue = numberOrNull(d.ndvi);
+    var rainValue = numberOrNull(d.rain);
+    var riskValue = numberOrNull(d.risk);
+    var classValue = numberOrNull(d.cls);
+
     inspector.add(ui.Label('Elevation: ' +
-      (d.elev !== null ? d.elev.toFixed(0) + ' m' : 'n/a'),
+      (elevValue !== null ? elevValue.toFixed(0) + ' m' : 'n/a'),
       {fontSize: '11px', margin: '4px 0 0 0'}));
     inspector.add(ui.Label('Slope: ' +
-      (d.slope !== null ? d.slope.toFixed(1) + '°' : 'n/a'),
+      (slopeValue !== null ? slopeValue.toFixed(1) + '°' : 'n/a'),
       {fontSize: '11px', margin: '0'}));
     inspector.add(ui.Label('NDVI (vegetation): ' +
-      (d.ndvi !== null ? d.ndvi.toFixed(3) : 'n/a'),
+      (ndviValue !== null ? ndviValue.toFixed(3) : 'n/a'),
       {fontSize: '11px', margin: '0'}));
     inspector.add(ui.Label('7-day rainfall: ' +
-      (d.rain !== null ? d.rain.toFixed(1) + ' mm' : 'n/a'),
+      (rainValue !== null ? rainValue.toFixed(1) + ' mm' : 'n/a'),
       {fontSize: '11px', margin: '0'}));
 
-    var riskLbl = (d.risk !== null) ? d.risk.toFixed(3) : 'n/a';
-    var clsLbl  = (d.cls === 1) ? 'LOW' : (d.cls === 2) ? 'MODERATE' :
-                  (d.cls === 3) ? 'HIGH' : (d.cls === 4) ? 'EXTREME' : '?';
-    var clsColor = (d.cls === 1) ? '#388E3C' : (d.cls === 2) ? '#FBC02D' :
-                   (d.cls === 3) ? '#F57C00' : (d.cls === 4) ? '#B71C1C' : '#888';
+    var riskLbl = (riskValue !== null) ? riskValue.toFixed(3) : 'n/a';
+    var clsLbl  = (classValue === 1) ? 'LOW' : (classValue === 2) ? 'MODERATE' :
+                  (classValue === 3) ? 'HIGH' : (classValue === 4) ? 'EXTREME' : '?';
+    var clsColor = (classValue === 1) ? '#388E3C' : (classValue === 2) ? '#FBC02D' :
+                   (classValue === 3) ? '#F57C00' : (classValue === 4) ? '#B71C1C' : '#888';
 
-    inspector.add(ui.Label('PREDICTED RISK: ' + riskLbl + ' (' + clsLbl + ')',
+    inspector.add(ui.Label('SUSCEPTIBILITY: ' + riskLbl + ' (' + clsLbl + ')',
       {fontSize: '12px', margin: '6px 0 0 0', fontWeight: 'bold',
        color: clsColor}));
   });
@@ -679,7 +699,7 @@ map.onClick(function(coords) {
 
 var rainSeries = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
   .filterDate(eventDate.advance(-15, 'day'),
-              eventDate.advance(15, 'day'));
+              eventDate.advance(16, 'day'));
 
 var rainChart = ui.Chart.image.series({
   imageCollection: rainSeries,
@@ -698,16 +718,6 @@ panel.add(ui.Label('RAINFALL DRIVER',
   {fontSize: '12px', fontWeight: 'bold', margin: '14px 0 4px 0'}));
 panel.add(rainChart);
 
-var deathsChart = ui.Chart.feature.byFeature(affectedSites, 'name', 'deaths')
-  .setChartType('ColumnChart')
-  .setOptions({
-    title: 'Confirmed deaths by location (Nov 2025)',
-    vAxis: {title: 'Deaths'},
-    hAxis: {title: '', slantedText: true, slantedTextAngle: 30},
-    legend: {position: 'none'}, colors: ['#B71C1C'], height: 200
-  });
-panel.add(deathsChart);
-
 var riskHistogram = ui.Chart.image.histogram({
   image: riskScore,
   region: studyArea,
@@ -719,7 +729,7 @@ var riskHistogram = ui.Chart.image.histogram({
   vAxis: {title: 'Pixel count'},
   colors: ['#B71C1C'], legend: {position: 'none'}, height: 200
 });
-panel.add(ui.Label('FUTURE-RISK DISTRIBUTION',
+panel.add(ui.Label('SUSCEPTIBILITY DISTRIBUTION',
   {fontSize: '12px', fontWeight: 'bold', margin: '14px 0 4px 0'}));
 panel.add(riskHistogram);
 
